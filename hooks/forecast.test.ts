@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { Meter } from '../types'
-import { addContext, addSample, bar, compact, duration, fit, fiveRate, hitRatio, isExpensive, learnTtl, limitOutlook, outlook, segments, spark, tint, turnsLeft, until, weekRate, width } from './register'
+import { addContext, addSample, bar, cells, compact, duration, fit, fiveRate, hitRatio, isExpensive, learnTtl, limitOutlook, outlook, segments, spark, tint, turnsLeft, until, weekRate, width } from './register'
 
 const MIN = 60_000
 
@@ -97,21 +97,25 @@ test('isExpensive needs history and double the average', () => {
   expect(isExpensive(5, [0.1])).toBe(false)
 })
 
-test('bar fills in eighths, clamps and shades the landing', () => {
-  const text = (p: number, landing?: number) => bar(p, landing).map(x => x.text).join('')
-  expect(text(50)).toBe('▕████    ▏')
-  expect(text(0)).toBe('▕        ▏')
-  expect(text(130)).toBe('▕████████▏')
-  expect(text(8)).toBe('▕▋       ▏')
-  expect(text(25, 75)).toBe('▕██░░░░  ▏')
-  expect(text(50, 140)).toBe('▕████░░░░▏')
+test('cells show any use, clamp and reach the landing', () => {
+  expect(cells(50, undefined, 10)).toEqual({ fill: 5, tail: 0 })
+  expect(cells(0, undefined, 10)).toEqual({ fill: 0, tail: 0 })
+  expect(cells(3, undefined, 10)).toEqual({ fill: 1, tail: 0 })
+  expect(cells(130, undefined, 10)).toEqual({ fill: 10, tail: 0 })
+  expect(cells(20, 75, 10)).toEqual({ fill: 2, tail: 6 })
+  expect(cells(50, 140, 10)).toEqual({ fill: 5, tail: 5 })
+})
+
+test('bar paints one space per cell', () => {
+  const b = bar(50, 80)
+  expect(b.map(c => c.text).join('')).toBe(' '.repeat(10))
+  expect(new Set(b.map(c => c.bg)).size > 3).toBe(true)
 })
 
 test('tint runs from accent through amber to red', () => {
-  expect(tint(0)).toBe('#d97757')
-  expect(tint(60)).toBe('#d97757')
-  expect(tint(80)).toBe('#e5a50a')
-  expect(tint(100)).toBe('#e5484d')
+  expect(tint(0)).toEqual([217, 119, 87])
+  expect(tint(80)).toEqual([229, 165, 10])
+  expect(tint(100)).toEqual([229, 72, 77])
 })
 
 const BASE: Meter = { busy: false, ctxHistory: [], fiveSamples: [], usdHistory: [] }

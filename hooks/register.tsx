@@ -98,33 +98,35 @@ export function isExpensive(usd: number | undefined, history: number[]): boolean
 }
 
 const clamp = (p: number) => Math.min(100, Math.max(0, p))
-const PARTIAL = '▏▎▍▌▋▊▉'
 const STOPS: [number, number[]][] = [[0, [217, 119, 87]], [60, [217, 119, 87]], [80, [229, 165, 10]], [100, [229, 72, 77]]]
+const TRACK = [68, 70, 79]
+
+const hex = (rgb: number[]) => `#${rgb.map(c => Math.round(c).toString(16).padStart(2, '0')).join('')}`
+const mix = (a: number[], b: number[], k: number) => a.map((c, j) => c + (b[j]! - c) * k)
 
 // Each cell takes the color of the percent it stands for: accent, amber, red.
-export function tint(p: number): string {
+export function tint(p: number): number[] {
   const x = clamp(p)
   const hi = Math.max(1, STOPS.findIndex(([at]) => at >= x))
   const [a, ca] = STOPS[hi - 1]!
   const [b, cb] = STOPS[hi]!
-  return `#${ca.map((c, j) => Math.round(c + (cb[j]! - c) * ((x - a) / (b - a))).toString(16).padStart(2, '0')).join('')}`
+  return mix(ca, cb, (x - a) / (b - a))
 }
 
-// The shaded tail runs from today's fill to where the pace lands at reset.
-export function bar(p: number, landing?: number, width = 8): Part[] {
-  const eighths = Math.round((clamp(p) / 100) * width * 8)
-  const full = Math.floor(eighths / 8)
-  const rest = eighths % 8
-  const used = full + (rest ? 1 : 0)
-  const end = landing === undefined ? used : Math.max(used, Math.round((clamp(landing) / 100) * width))
-  const cell = (text: string, i: number): Part => ({ text, color: tint(((i + 0.5) / width) * 100) })
-  return [
-    { text: '▕', dim: true },
-    ...Array.from({ length: full }, (_, i) => cell('█', i)),
-    ...(rest ? [cell(PARTIAL[rest - 1]!, full)] : []),
-    ...Array.from({ length: end - used }, (_, i) => cell('░', used + i)),
-    { text: `${' '.repeat(width - end)}▏`, dim: true },
-  ]
+// Any use shows one cell; the tail reaches where the pace lands at reset.
+export function cells(p: number, landing: number | undefined, width: number): { fill: number; tail: number } {
+  const fill = p > 0 ? Math.max(1, Math.round((clamp(p) / 100) * width)) : 0
+  const end = landing === undefined ? fill : Math.max(fill, Math.round((clamp(landing) / 100) * width))
+  return { fill, tail: end - fill }
+}
+
+// Painted spaces fill the cell exactly in any font; block glyphs do not.
+export function bar(p: number, landing?: number, width = 10): Part[] {
+  const { fill, tail } = cells(p, landing, width)
+  return Array.from({ length: width }, (_, i) => {
+    const heat = tint(((i + 0.5) / width) * 100)
+    return { text: ' ', bg: hex(i < fill ? heat : i < fill + tail ? mix(heat, TRACK, 0.55) : TRACK) }
+  })
 }
 
 export function spark(xs: number[]): string {
@@ -149,7 +151,7 @@ function heat(p: number) {
   return p >= 90 ? 'red' : p >= 70 ? 'yellow' : undefined
 }
 
-export type Part = { text: string; color?: string; dim?: boolean; bold?: boolean }
+export type Part = { text: string; color?: string; bg?: string; dim?: boolean; bold?: boolean }
 // Higher priority drops first; full gives way to lean before anything is hidden.
 export type Segment = { id: string; priority: number; full: Part[]; lean: Part[] }
 
@@ -365,7 +367,7 @@ export const register: Register = on => {
     const m = await read($, meter)
     const columns = e.props.bodyColumns ?? e.viewport?.columns ?? 120
     const { left, repo } = fit(segments(m, await $.clock.now()), columns)
-    const draw = (parts: Part[]) => parts.map(p => <Text color={p.color} dimColor={p.dim} bold={p.bold}>{p.text}</Text>)
+    const draw = (parts: Part[]) => parts.map(p => <Text color={p.color} backgroundColor={p.bg} dimColor={p.dim} bold={p.bold}>{p.text}</Text>)
 
     return (
       <Box justifyContent="space-between" width={columns}>

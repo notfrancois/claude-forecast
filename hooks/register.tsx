@@ -79,13 +79,34 @@ export function learnTtl(gapMs: number, hit: number | undefined): Ttl | undefine
   return hit >= 50 ? '1h' : hit < 20 ? '5m' : undefined
 }
 
-export function turnsLeft(history: number[], current?: number): number | undefined {
+export function turnsLeft(history: number[], current?: number, limit = 100): number | undefined {
   if (current === undefined) return undefined
   const deltas = history.slice(1).map((p, i) => p - history[i]!).filter(d => d > 0)
   if (deltas.length === 0) return undefined
   const avg = deltas.reduce((a, b) => a + b, 0) / deltas.length
-  return Math.floor((100 - current) / avg)
+  return Math.max(0, Math.floor((limit - current) / avg))
 }
+
+type Usage = { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }
+const WRITE: Record<Ttl, number> = { '5m': 1.25, '1h': 2 }
+
+// ponytail: assumes Anthropic's fixed ratios to input; breaks if those change.
+export function inputPrice(usd: number, u: Usage, ttl: Ttl): number | undefined {
+  const units = u.input_tokens + u.cache_creation_input_tokens * WRITE[ttl] + u.cache_read_input_tokens * 0.1 + u.output_tokens * 5
+  return units > 0 && usd > 0 ? usd / units : undefined
+}
+
+// What a cold turn pays over a warm one: writing the context instead of reading it.
+export function coldCost(tokens: number, price: number, ttl: Ttl): number {
+  return tokens * price * (WRITE[ttl] - 0.1)
+}
+
+export function burnRate(usd: number, startedAt: number, now: number): number | undefined {
+  const hours = (now - startedAt) / (60 * MIN)
+  return hours < 1 / 6 ? undefined : usd / hours
+}
+
+const money = (usd: number) => `$${usd.toFixed(2)}`
 
 export function hitRatio(u: { input_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }): number | undefined {
   const total = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
@@ -182,8 +203,11 @@ function limit(id: '5h' | 'wk', priority: number, m: Meter, now: number): Segmen
   const o = limitOutlook(m, id, now)
   if (o.p === undefined) return undefined
   const g = gauge(id, o.p, o.landing)
-  const out = runsOut(o)
-  const risk: Part[] = out ? [{ text: ` out in ${duration(o.eta!)}`, color: 'red', bold: true }] : []
+  const spent = o.p >= 100 && o.resetIn !== undefined && o.resetIn > 0
+  const out = !spent && runsOut(o)
+  const risk: Part[] = spent
+    ? [{ text: ` resumes in ${duration(o.resetIn!)}`, color: 'red', bold: true }]
+    : out ? [{ text: ` out in ${duration(o.eta!)}`, color: 'red', bold: true }] : []
   const reset: Part[] = o.resetIn !== undefined && (out || o.p >= 70) ? [{ text: ` →${until(now + o.resetIn, now)}`, dim: true }] : []
   return { id, priority, full: [...g.full, ...risk, ...reset], lean: [...g.lean, ...risk] }
 }
@@ -192,8 +216,9 @@ export function segments(m: Meter, now: number): Segment[] {
   const out: Segment[] = []
   if (m.context !== undefined) {
     const g = gauge('ctx', m.context)
-    const turns = turnsLeft(m.ctxHistory, m.context)
-    const more: Part[] = m.context >= 50 && turns !== undefined ? [{ text: ` ~${turns} turns`, dim: true }] : []
+    const turns = turnsLeft(m.ctxHistory, m.context, m.compactAt)
+    const label = m.compactAt === undefined ? `~${turns} turns` : `compact in ~${turns} turns`
+    const more: Part[] = m.context >= 50 && turns !== undefined ? [{ text: ` ${label}`, color: turns <= 2 ? 'yellow' : undefined, dim: turns > 2 }] : []
     out.push({ id: 'ctx', priority: 0, full: [...g.full, ...more], lean: [...g.lean, ...more] })
   }
   for (const s of [limit('5h', 2, m, now), limit('wk', 4, m, now)]) if (s) out.push(s)
@@ -201,21 +226,35 @@ export function segments(m: Meter, now: number): Segment[] {
     const left = TTL[m.ttl ?? '1h'] - (now - m.lastResponseAt)
     // Under 80 % the turn re-paid most of its context: worth a glance.
     const head: Part[] = [{ text: 'cache hit ', dim: true }, ...(m.hitRatio !== undefined ? [{ text: `${m.hitRatio}%`, color: m.hitRatio < 80 ? 'yellow' : undefined }] : [])]
-    const state: Part[] = m.busy ? [] : left <= 0 ? [{ text: ' · ', dim: true }, { text: 'cold', color: 'yellow' }] : left <= 5 * MIN ? [{ text: ' · ', dim: true }, { text: `${duration(left)} left`, color: left <= MIN ? 'red' : 'yellow' }] : []
+    const refill = m.ctxTokens !== undefined && m.inputUsd !== undefined ? coldCost(m.ctxTokens, m.inputUsd, m.ttl ?? '1h') : 0
+    const price: Part[] = refill >= 0.01 ? [{ text: `, next turn +${money(refill)}`, dim: true }] : []
+    const state: Part[] = m.busy
+      ? []
+      : left <= 0
+        ? [{ text: ' · ', dim: true }, { text: 'cold', color: 'yellow' }, ...price]
+        : left <= 5 * MIN
+          ? [{ text: ' · ', dim: true }, { text: `${duration(left)} left`, color: left <= MIN ? 'red' : 'yellow' }, ...price]
+          : []
     out.push({ id: 'cache', priority: 3, full: [...head, ...state], lean: [...head, ...state] })
   }
   if (m.turnTokens !== undefined) {
     const pricey = isExpensive(m.turnUsd, m.usdHistory.slice(0, -1))
     const color = pricey ? 'yellow' : undefined
-    const usd: Part[] = m.turnUsd !== undefined ? [{ text: `$${m.turnUsd.toFixed(2)}`, color }] : [{ text: compact(m.turnTokens), color }]
+    const usd: Part[] = m.turnUsd !== undefined ? [{ text: money(m.turnUsd), color }] : [{ text: compact(m.turnTokens), color }]
+    const agents: Part[] = m.agents && m.agentUsd !== undefined ? [{ text: ` · ${m.agents} agent${m.agents > 1 ? 's' : ''} ${money(m.agentUsd)}`, dim: true }] : []
     const flag: Part[] = pricey ? [{ text: ' ▲', color }] : []
     const trend: Part[] = m.usdHistory.length >= 3 ? [{ text: `${spark(m.usdHistory)} `, color: ACCENT, dim: true }] : []
     out.push({
       id: 'turn',
       priority: 5,
-      full: [{ text: 'turn ', dim: true }, ...trend, { text: compact(m.turnTokens), color }, ...(m.turnUsd !== undefined ? [{ text: ' · ', dim: true }, usd[0]!] : []), ...flag],
+      full: [{ text: 'turn ', dim: true }, ...trend, { text: compact(m.turnTokens), color }, ...(m.turnUsd !== undefined ? [{ text: ' · ', dim: true }, usd[0]!] : []), ...flag, ...agents],
       lean: [{ text: 'turn ', dim: true }, ...usd, ...flag],
     })
+  }
+  if (m.sessionUsd !== undefined && m.startedAt !== undefined) {
+    const rate = burnRate(m.sessionUsd, m.startedAt, now)
+    const head: Part[] = [{ text: 'session ', dim: true }, { text: money(m.sessionUsd) }]
+    out.push({ id: 'session', priority: 5.5, full: [...head, ...(rate !== undefined ? [{ text: ` · ${money(rate)}/h`, dim: true }] : [])], lean: head })
   }
   if (m.repo) {
     const head: Part[] = [{ text: '⎇ ', color: ACCENT }, { text: m.repo }]
@@ -263,6 +302,9 @@ export const register: Register = on => {
   let warnedCacheFor: number | undefined
   const warnedFor: Partial<Record<'5h' | 'wk', string>> = {}
   let gapAtStart: number | undefined
+  let mainUsd = 0
+  const agentIds = new Set<string>()
+  const notifiedReset: Partial<Record<'5h' | 'wk', string>> = {}
 
   on('session.start', async ($, e, next) => {
     const ran = await next(e)
@@ -271,21 +313,38 @@ export const register: Register = on => {
     const stored = await $.store.get('ttl')
     const ttl: Ttl | undefined = stored === '5m' || stored === '1h' ? stored : undefined
     if (ttl) await update($, meter, m => ({ ...m, ttl }))
+    const usage = await $.session.usage({ breakdown: 'summary' })
+    const at = usage.context.breakdown?.autoCompactThreshold
+    const compactAt = at && usage.context.window ? (at / usage.context.window) * 100 : undefined
+    await update($, meter, m => ({ ...m, compactAt, startedAt: usage.startedAt, sessionUsd: usage.cost?.usd }))
     $.clock.every(1000, async () => {
       await update($, tick, t => t + 1)
       const m = await read($, meter)
+      const now = await $.clock.now()
+      for (const id of ['5h', 'wk'] as const) {
+        const p = id === '5h' ? m.fiveHour : m.weekly
+        const reset = id === '5h' ? m.fiveReset : m.weeklyReset
+        if (p === undefined || p < 100 || !reset || Date.parse(reset) > now || notifiedReset[id] === reset) continue
+        notifiedReset[id] = reset
+        $.ui.toast(`The ${LIMIT_NAME[id]} limit has reset: back to work`)
+      }
       if (m.busy || m.lastResponseAt === undefined || warnedCacheFor === m.lastResponseAt) return
       const left = TTL[m.ttl ?? '1h'] - ((await $.clock.now()) - m.lastResponseAt)
       if (left > 0 && left <= MIN) {
         warnedCacheFor = m.lastResponseAt
-        $.ui.toast(`Prompt cache expires in ${duration(left)}: reply now or the next turn re-writes it`)
+        const refill = m.ctxTokens !== undefined && m.inputUsd !== undefined ? coldCost(m.ctxTokens, m.inputUsd, m.ttl ?? '1h') : 0
+        const cost = refill >= 0.01 ? ` (+${money(refill)})` : ''
+        $.ui.toast(`Prompt cache expires in ${duration(left)}: reply now or the next turn re-writes it${cost}`)
       }
     })
     return ran
   })
 
   on('turn.start', async ($, e, next) => {
+    if (e.agentId !== undefined && (await read($, meter)).busy) agentIds.add(e.agentId)
     if (e.agentId === undefined) {
+      mainUsd = 0
+      agentIds.clear()
       costAtStart = (await $.session.usage()).cost?.usd
       const m = await update($, meter, m => ({ ...m, busy: true }))
       gapAtStart = m.lastResponseAt === undefined ? undefined : (await $.clock.now()) - m.lastResponseAt
@@ -295,8 +354,14 @@ export const register: Register = on => {
 
   // Every main-loop response refreshes the cache entry the TTL counts from.
   on('turn.step', async function* ($, e, next) {
+    const usdBefore = e.agentId === undefined ? (await $.session.usage()).cost?.usd : undefined
     const r = yield* next(e)
     if (e.agentId === undefined && r.usage) {
+      const after = (await $.session.usage()).cost?.usd
+      const stepUsd = usdBefore !== undefined && after !== undefined ? after - usdBefore : undefined
+      if (stepUsd !== undefined) mainUsd += stepUsd
+      const inputUsd = stepUsd === undefined ? undefined : inputPrice(stepUsd, r.usage, (await read($, meter)).ttl ?? '1h')
+      if (inputUsd !== undefined) await update($, meter, m => ({ ...m, inputUsd }))
       const lastResponseAt = await $.clock.now()
       const learned = gapAtStart === undefined ? undefined : learnTtl(gapAtStart, hitRatio(r.usage))
       gapAtStart = undefined
@@ -330,6 +395,8 @@ export const register: Register = on => {
         turnTokens: u ? u.input_tokens + u.output_tokens + u.cache_creation_input_tokens : undefined,
         hitRatio: u ? hitRatio(u) : m.hitRatio,
         turnUsd,
+        agents: agentIds.size,
+        agentUsd: turnUsd === undefined ? undefined : Math.max(0, turnUsd - mainUsd),
         usdHistory: turnUsd === undefined ? m.usdHistory : push(m.usdHistory, turnUsd),
       }))
     }
@@ -343,6 +410,8 @@ export const register: Register = on => {
     const m = await update($, meter, m => ({
       ...m,
       context: e.context.percent,
+      ctxTokens: e.context.tokens,
+      sessionUsd: e.cost?.usd ?? m.sessionUsd,
       ctxHistory: e.context.percent === undefined ? m.ctxHistory : addContext(m.ctxHistory, e.context.percent),
       fiveHour: five?.percentUsed,
       fiveReset: five?.resetsAt,

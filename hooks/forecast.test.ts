@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { Meter } from '../types'
-import { addContext, addSample, bar, cells, compact, duration, fit, fiveRate, hitRatio, isExpensive, learnTtl, limitOutlook, outlook, segments, spark, tint, turnsLeft, until, weekRate, width } from './register'
+import { addContext, burnRate, coldCost, inputPrice, addSample, bar, cells, compact, duration, fit, fiveRate, hitRatio, isExpensive, learnTtl, limitOutlook, outlook, segments, spark, tint, turnsLeft, until, weekRate, width } from './register'
 
 const MIN = 60_000
 
@@ -181,4 +181,42 @@ test('cache hit turns yellow under 80 %', () => {
   expect(low.full[1]!.color).toBe('yellow')
   const ok = segments(FULL, MIN).find(s => s.id === 'cache')!
   expect(ok.full[1]!.color).toBe(undefined)
+})
+
+test('turnsLeft counts to the auto-compact point', () => {
+  expect(turnsLeft([40, 50, 60], 60, 80)).toBe(2)
+  expect(turnsLeft([40, 50, 90], 90, 80)).toBe(0)
+})
+
+test('inputPrice recovers the input rate from a priced step', () => {
+  // $3 per million input: 1000 in, 2000 written at 1h (2x), 10000 read (0.1x), 100 out (5x).
+  const u = { input_tokens: 1000, output_tokens: 100, cache_read_input_tokens: 10_000, cache_creation_input_tokens: 2000 }
+  const usd = (1000 + 4000 + 1000 + 500) * 3e-6
+  expect(Math.round(inputPrice(usd, u, '1h')! * 1e9)).toBe(3000)
+  expect(inputPrice(0, u, '1h')).toBe(undefined)
+  expect(coldCost(100_000, 3e-6, '1h').toFixed(2)).toBe('0.57')
+})
+
+test('cache shows what a cold turn costs', () => {
+  const cold = { ...FULL, ctxTokens: 100_000, inputUsd: 3e-6, lastResponseAt: -2 * 60 * MIN }
+  const seg = segments(cold, MIN).find(s => s.id === 'cache')!
+  expect(seg.full.map(p => p.text).join('')).toBe('cache hit 99% · cold, next turn +$0.57')
+})
+
+test('a spent limit counts down to its reset', () => {
+  const spent = { ...FULL, fiveHour: 100, fiveReset: new Date(43 * MIN).toISOString() }
+  const seg = segments(spent, MIN).find(s => s.id === '5h')!
+  expect(seg.lean.map(p => p.text).join('')).toBe('5h 100% resumes in 42m')
+})
+
+test('turn names the agents and what they cost', () => {
+  const seg = segments({ ...FULL, agents: 3, agentUsd: 0.2 }, MIN).find(s => s.id === 'turn')!
+  expect(seg.full.map(p => p.text).join('').endsWith(' · 3 agents $0.20')).toBe(true)
+})
+
+test('session burn rate waits ten minutes', () => {
+  expect(burnRate(2, 0, 30 * MIN)).toBe(4)
+  expect(burnRate(2, 0, 5 * MIN)).toBe(undefined)
+  const seg = segments({ ...FULL, sessionUsd: 2, startedAt: -29 * MIN }, MIN).find(s => s.id === 'session')!
+  expect(seg.full.map(p => p.text).join('')).toBe('session $2.00 · $4.00/h')
 })

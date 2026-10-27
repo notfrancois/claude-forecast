@@ -3,6 +3,8 @@ export type Sample = { t: number; p: number }
 export type Meter = {
   busy: boolean
   context?: number
+  ctxTokens?: number
+  compactAt?: number
   ctxHistory: number[]
   fiveHour?: number
   fiveReset?: string
@@ -14,6 +16,11 @@ export type Meter = {
   hitRatio?: number
   turnTokens?: number
   turnUsd?: number
+  agents?: number
+  agentUsd?: number
+  inputUsd?: number
+  sessionUsd?: number
+  startedAt?: number
   usdHistory: number[]
   repo?: string
   branch?: string

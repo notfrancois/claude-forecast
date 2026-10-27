@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { Meter } from '../types'
-import { addContext, addSample, bar, compact, duration, fit, fiveRate, hitRatio, isExpensive, learnTtl, limitOutlook, outlook, segments, spark, turnsLeft, until, weekRate, width } from './register'
+import { addContext, addSample, bar, compact, duration, fit, fiveRate, hitRatio, isExpensive, learnTtl, limitOutlook, outlook, segments, spark, tint, turnsLeft, until, weekRate, width } from './register'
 
 const MIN = 60_000
 
@@ -97,12 +97,21 @@ test('isExpensive needs history and double the average', () => {
   expect(isExpensive(5, [0.1])).toBe(false)
 })
 
-test('bar fills by percent, clamps and ghosts the landing', () => {
-  expect(bar(50)).toEqual(['━━━━', '', '────'])
-  expect(bar(0)).toEqual(['', '', '────────'])
-  expect(bar(130)).toEqual(['━━━━━━━━', '', ''])
-  expect(bar(25, 75)).toEqual(['━━', '╍╍╍╍', '──'])
-  expect(bar(50, 140)).toEqual(['━━━━', '╍╍╍╍', ''])
+test('bar fills in eighths, clamps and shades the landing', () => {
+  const text = (p: number, landing?: number) => bar(p, landing).map(x => x.text).join('')
+  expect(text(50)).toBe('▕████    ▏')
+  expect(text(0)).toBe('▕        ▏')
+  expect(text(130)).toBe('▕████████▏')
+  expect(text(8)).toBe('▕▋       ▏')
+  expect(text(25, 75)).toBe('▕██░░░░  ▏')
+  expect(text(50, 140)).toBe('▕████░░░░▏')
+})
+
+test('tint runs from accent through amber to red', () => {
+  expect(tint(0)).toBe('#d97757')
+  expect(tint(60)).toBe('#d97757')
+  expect(tint(80)).toBe('#e5a50a')
+  expect(tint(100)).toBe('#e5484d')
 })
 
 const BASE: Meter = { busy: false, ctxHistory: [], fiveSamples: [], usdHistory: [] }

@@ -97,13 +97,34 @@ export function isExpensive(usd: number | undefined, history: number[]): boolean
   return usd > (2 * history.reduce((a, b) => a + b, 0)) / history.length
 }
 
-const cells = (p: number, width: number) => Math.min(width, Math.max(0, Math.round((p / 100) * width)))
+const clamp = (p: number) => Math.min(100, Math.max(0, p))
+const PARTIAL = '▏▎▍▌▋▊▉'
+const STOPS: [number, number[]][] = [[0, [217, 119, 87]], [60, [217, 119, 87]], [80, [229, 165, 10]], [100, [229, 72, 77]]]
 
-// The ghost runs from today's fill to where the current pace lands at reset.
-export function bar(p: number, landing?: number, width = 8): [string, string, string] {
-  const filled = cells(p, width)
-  const ghost = landing === undefined ? 0 : Math.max(0, cells(landing, width) - filled)
-  return ['━'.repeat(filled), '╍'.repeat(ghost), '─'.repeat(width - filled - ghost)]
+// Each cell takes the color of the percent it stands for: accent, amber, red.
+export function tint(p: number): string {
+  const x = clamp(p)
+  const hi = Math.max(1, STOPS.findIndex(([at]) => at >= x))
+  const [a, ca] = STOPS[hi - 1]!
+  const [b, cb] = STOPS[hi]!
+  return `#${ca.map((c, j) => Math.round(c + (cb[j]! - c) * ((x - a) / (b - a))).toString(16).padStart(2, '0')).join('')}`
+}
+
+// The shaded tail runs from today's fill to where the pace lands at reset.
+export function bar(p: number, landing?: number, width = 8): Part[] {
+  const eighths = Math.round((clamp(p) / 100) * width * 8)
+  const full = Math.floor(eighths / 8)
+  const rest = eighths % 8
+  const used = full + (rest ? 1 : 0)
+  const end = landing === undefined ? used : Math.max(used, Math.round((clamp(landing) / 100) * width))
+  const cell = (text: string, i: number): Part => ({ text, color: tint(((i + 0.5) / width) * 100) })
+  return [
+    { text: '▕', dim: true },
+    ...Array.from({ length: full }, (_, i) => cell('█', i)),
+    ...(rest ? [cell(PARTIAL[rest - 1]!, full)] : []),
+    ...Array.from({ length: end - used }, (_, i) => cell('░', used + i)),
+    { text: `${' '.repeat(width - end)}▏`, dim: true },
+  ]
 }
 
 export function spark(xs: number[]): string {
@@ -133,12 +154,10 @@ export type Part = { text: string; color?: string; dim?: boolean; bold?: boolean
 export type Segment = { id: string; priority: number; full: Part[]; lean: Part[] }
 
 function gauge(label: string, p: number, landing?: number): { full: Part[]; lean: Part[] } {
-  const [filled, ghost, empty] = bar(p, landing)
   const value: Part = { text: pct(p), color: heat(p), bold: heat(p) === 'red' }
   const head: Part = { text: `${label} `, dim: true }
-  const trail: Part = { text: ghost, color: landing === undefined ? undefined : heat(landing) ?? ACCENT, dim: true }
   return {
-    full: [head, { text: filled, color: heat(p) ?? ACCENT }, trail, { text: `${empty} `, dim: true }, value],
+    full: [head, ...bar(p, landing), { text: ' ' }, value],
     lean: [head, value],
   }
 }

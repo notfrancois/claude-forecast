@@ -10,6 +10,7 @@ export type Meter = {
   weekly?: number
   weeklyReset?: string
   lastResponseAt?: number
+  ttl?: '5m' | '1h'
   hitRatio?: number
   turnTokens?: number
   turnUsd?: number

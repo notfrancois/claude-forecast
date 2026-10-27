@@ -12,6 +12,9 @@ const MIN = 60_000
 const RATE_WINDOW = 30 * MIN
 const MIN_SPAN = 2 * MIN
 const KEEP = 6
+const WEEK = 7 * 24 * 60 * MIN
+const TTL = { '5m': 5 * MIN, '1h': 60 * MIN } as const
+export type Ttl = keyof typeof TTL
 
 export function duration(ms: number): string {
   if (ms < MIN) return `${Math.max(0, Math.round(ms / 1000))}s`
@@ -40,13 +43,40 @@ export function addSample(samples: Sample[], s: Sample): Sample[] {
   return [...samples, s].filter(x => s.t - x.t <= RATE_WINDOW)
 }
 
-export function etaMs(samples: Sample[], now: number): number | undefined {
+// Least squares over every sample, so one burst cannot swing the forecast.
+export function fiveRate(samples: Sample[]): number | undefined {
   const first = samples[0]
   const last = samples[samples.length - 1]
   if (!first || !last || last.t - first.t < MIN_SPAN) return undefined
-  const rate = (last.p - first.p) / (last.t - first.t)
-  if (rate <= 0) return undefined
-  return Math.max(0, (100 - last.p) / rate - (now - last.t))
+  const mean = (f: (s: Sample) => number) => samples.reduce((a, s) => a + f(s), 0) / samples.length
+  const mt = mean(s => s.t)
+  const mp = mean(s => s.p)
+  return mean(s => (s.t - mt) * (s.p - mp)) / mean(s => (s.t - mt) ** 2)
+}
+
+// A week of usage has nights and days off; its own average is the steady pace.
+export function weekRate(p: number, resetAt: number, now: number): number | undefined {
+  const elapsed = now - (resetAt - WEEK)
+  return elapsed < 60 * MIN ? undefined : p / elapsed
+}
+
+export type Outlook = { eta?: number; landing?: number }
+
+export function outlook(p: number, rate: number | undefined, resetIn: number | undefined): Outlook {
+  if (rate === undefined || rate <= 0) return {}
+  return { eta: (100 - p) / rate, landing: resetIn === undefined ? undefined : p + rate * resetIn }
+}
+
+// A drop means a compact or /clear; growth before it describes another context.
+export function addContext(history: number[], p: number): number[] {
+  const last = history[history.length - 1]
+  return last !== undefined && p < last ? [p] : push(history, p)
+}
+
+// After a gap between both lifetimes, a warm cache proves 1h and a cold one 5m.
+export function learnTtl(gapMs: number, hit: number | undefined): Ttl | undefined {
+  if (hit === undefined || gapMs <= 6 * MIN || gapMs >= 55 * MIN) return undefined
+  return hit >= 50 ? '1h' : hit < 20 ? '5m' : undefined
 }
 
 export function turnsLeft(history: number[], current?: number): number | undefined {
@@ -67,9 +97,18 @@ export function isExpensive(usd: number | undefined, history: number[]): boolean
   return usd > (2 * history.reduce((a, b) => a + b, 0)) / history.length
 }
 
-export function bar(p: number, width = 5): [string, string] {
-  const filled = Math.min(width, Math.max(0, Math.round((p / 100) * width)))
-  return ['━'.repeat(filled), '─'.repeat(width - filled)]
+const cells = (p: number, width: number) => Math.min(width, Math.max(0, Math.round((p / 100) * width)))
+
+// The ghost runs from today's fill to where the current pace lands at reset.
+export function bar(p: number, landing?: number, width = 8): [string, string, string] {
+  const filled = cells(p, width)
+  const ghost = landing === undefined ? 0 : Math.max(0, cells(landing, width) - filled)
+  return ['━'.repeat(filled), '╍'.repeat(ghost), '─'.repeat(width - filled - ghost)]
+}
+
+export function spark(xs: number[]): string {
+  const max = Math.max(...xs)
+  return xs.map(x => '▁▂▃▄▅▆▇█'[max > 0 ? Math.round((x / max) * 7) : 0]).join('')
 }
 
 function pick(limits: SessionRateLimit[], kind: string) {
@@ -93,17 +132,42 @@ export type Part = { text: string; color?: string; dim?: boolean; bold?: boolean
 // Higher priority drops first; full gives way to lean before anything is hidden.
 export type Segment = { id: string; priority: number; full: Part[]; lean: Part[] }
 
-function gauge(label: string, p: number): { full: Part[]; lean: Part[] } {
-  const [filled, empty] = bar(p)
+function gauge(label: string, p: number, landing?: number): { full: Part[]; lean: Part[] } {
+  const [filled, ghost, empty] = bar(p, landing)
   const value: Part = { text: pct(p), color: heat(p), bold: heat(p) === 'red' }
   const head: Part = { text: `${label} `, dim: true }
+  const trail: Part = { text: ghost, color: landing === undefined ? undefined : heat(landing) ?? ACCENT, dim: true }
   return {
-    full: [head, { text: filled, color: heat(p) ?? ACCENT }, { text: `${empty} `, dim: true }, value],
+    full: [head, { text: filled, color: heat(p) ?? ACCENT }, trail, { text: `${empty} `, dim: true }, value],
     lean: [head, value],
   }
 }
 
-export function segments(m: Meter, now: number, ttlMs: number): Segment[] {
+export function limitOutlook(m: Meter, id: '5h' | 'wk', now: number): Outlook & { p?: number; resetIn?: number } {
+  const p = id === '5h' ? m.fiveHour : m.weekly
+  const reset = id === '5h' ? m.fiveReset : m.weeklyReset
+  if (p === undefined) return {}
+  const resetAt = reset ? Date.parse(reset) : undefined
+  const resetIn = resetAt === undefined ? undefined : resetAt - now
+  const rate = id === '5h' ? fiveRate(m.fiveSamples) : resetAt === undefined ? undefined : weekRate(p, resetAt, now)
+  return { p, resetIn, ...outlook(p, rate, resetIn) }
+}
+
+export function runsOut(o: Outlook & { resetIn?: number }): boolean {
+  return o.eta !== undefined && o.resetIn !== undefined && o.eta < o.resetIn
+}
+
+function limit(id: '5h' | 'wk', priority: number, m: Meter, now: number): Segment | undefined {
+  const o = limitOutlook(m, id, now)
+  if (o.p === undefined) return undefined
+  const g = gauge(id, o.p, o.landing)
+  const out = runsOut(o)
+  const risk: Part[] = out ? [{ text: ` out in ${duration(o.eta!)}`, color: 'red', bold: true }] : []
+  const reset: Part[] = o.resetIn !== undefined && (out || o.p >= 70) ? [{ text: ` →${until(now + o.resetIn, now)}`, dim: true }] : []
+  return { id, priority, full: [...g.full, ...risk, ...reset], lean: [...g.lean, ...risk] }
+}
+
+export function segments(m: Meter, now: number): Segment[] {
   const out: Segment[] = []
   if (m.context !== undefined) {
     const g = gauge('ctx', m.context)
@@ -111,22 +175,9 @@ export function segments(m: Meter, now: number, ttlMs: number): Segment[] {
     const more: Part[] = m.context >= 50 && turns !== undefined ? [{ text: ` ~${turns} turns`, dim: true }] : []
     out.push({ id: 'ctx', priority: 0, full: [...g.full, ...more], lean: [...g.lean, ...more] })
   }
-  if (m.fiveHour !== undefined) {
-    const g = gauge('5h', m.fiveHour)
-    const eta = etaMs(m.fiveSamples, now)
-    const resetIn = m.fiveReset ? Date.parse(m.fiveReset) - now : undefined
-    const runsOut = eta !== undefined && resetIn !== undefined && eta < resetIn
-    const risk: Part[] = runsOut ? [{ text: ` out in ${duration(eta!)}`, color: 'red', bold: true }] : []
-    const reset: Part[] = resetIn !== undefined && (runsOut || m.fiveHour >= 70) ? [{ text: ` →${until(now + resetIn, now)}`, dim: true }] : []
-    out.push({ id: '5h', priority: 2, full: [...g.full, ...risk, ...reset], lean: [...g.lean, ...risk] })
-  }
-  if (m.weekly !== undefined) {
-    const g = gauge('wk', m.weekly)
-    const reset: Part[] = m.weeklyReset && m.weekly >= 70 ? [{ text: ` →${until(Date.parse(m.weeklyReset), now)}`, dim: true }] : []
-    out.push({ id: 'wk', priority: 4, full: [...g.full, ...reset], lean: g.lean })
-  }
+  for (const s of [limit('5h', 2, m, now), limit('wk', 4, m, now)]) if (s) out.push(s)
   if (m.lastResponseAt !== undefined) {
-    const left = ttlMs - (now - m.lastResponseAt)
+    const left = TTL[m.ttl ?? '1h'] - (now - m.lastResponseAt)
     // Under 80 % the turn re-paid most of its context: worth a glance.
     const head: Part[] = [{ text: 'cache hit ', dim: true }, ...(m.hitRatio !== undefined ? [{ text: `${m.hitRatio}%`, color: m.hitRatio < 80 ? 'yellow' : undefined }] : [])]
     const state: Part[] = m.busy ? [] : left <= 0 ? [{ text: ' · ', dim: true }, { text: 'cold', color: 'yellow' }] : left <= 5 * MIN ? [{ text: ' · ', dim: true }, { text: `${duration(left)} left`, color: left <= MIN ? 'red' : 'yellow' }] : []
@@ -137,10 +188,11 @@ export function segments(m: Meter, now: number, ttlMs: number): Segment[] {
     const color = pricey ? 'yellow' : undefined
     const usd: Part[] = m.turnUsd !== undefined ? [{ text: `$${m.turnUsd.toFixed(2)}`, color }] : [{ text: compact(m.turnTokens), color }]
     const flag: Part[] = pricey ? [{ text: ' ▲', color }] : []
+    const trend: Part[] = m.usdHistory.length >= 3 ? [{ text: `${spark(m.usdHistory)} `, color: ACCENT, dim: true }] : []
     out.push({
       id: 'turn',
       priority: 5,
-      full: [{ text: 'turn ', dim: true }, { text: compact(m.turnTokens), color }, ...(m.turnUsd !== undefined ? [{ text: ' · ', dim: true }, usd[0]!] : []), ...flag],
+      full: [{ text: 'turn ', dim: true }, ...trend, { text: compact(m.turnTokens), color }, ...(m.turnUsd !== undefined ? [{ text: ' · ', dim: true }, usd[0]!] : []), ...flag],
       lean: [{ text: 'turn ', dim: true }, ...usd, ...flag],
     })
   }
@@ -183,21 +235,26 @@ async function refreshRepo($: Pick<CoreEngineInterface, 'process' | 'state'>, cw
   await update($, meter, m => ({ ...m, repo: top.split('/').pop(), branch }))
 }
 
-export const register: Register = (on, options) => {
-  const ttlMs = options.cacheTtl === '5m' ? 5 * MIN : 60 * MIN
+const LIMIT_NAME = { '5h': '5h', wk: 'weekly' } as const
+
+export const register: Register = on => {
   let costAtStart: number | undefined
   let warnedCacheFor: number | undefined
-  let warnedFiveFor: string | undefined
+  const warnedFor: Partial<Record<'5h' | 'wk', string>> = {}
+  let gapAtStart: number | undefined
 
   on('session.start', async ($, e, next) => {
     const ran = await next(e)
     // A reload re-runs session.start; keep the repo the last edit pointed to.
     if (!(await read($, meter)).repo) await refreshRepo($)
+    const stored = await $.store.get('ttl')
+    const ttl: Ttl | undefined = stored === '5m' || stored === '1h' ? stored : undefined
+    if (ttl) await update($, meter, m => ({ ...m, ttl }))
     $.clock.every(1000, async () => {
       await update($, tick, t => t + 1)
       const m = await read($, meter)
       if (m.busy || m.lastResponseAt === undefined || warnedCacheFor === m.lastResponseAt) return
-      const left = ttlMs - ((await $.clock.now()) - m.lastResponseAt)
+      const left = TTL[m.ttl ?? '1h'] - ((await $.clock.now()) - m.lastResponseAt)
       if (left > 0 && left <= MIN) {
         warnedCacheFor = m.lastResponseAt
         $.ui.toast(`Prompt cache expires in ${duration(left)}: reply now or the next turn re-writes it`)
@@ -209,7 +266,8 @@ export const register: Register = (on, options) => {
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
       costAtStart = (await $.session.usage()).cost?.usd
-      await update($, meter, m => ({ ...m, busy: true }))
+      const m = await update($, meter, m => ({ ...m, busy: true }))
+      gapAtStart = m.lastResponseAt === undefined ? undefined : (await $.clock.now()) - m.lastResponseAt
     }
     return next(e)
   })
@@ -219,7 +277,14 @@ export const register: Register = (on, options) => {
     const r = yield* next(e)
     if (e.agentId === undefined && r.usage) {
       const lastResponseAt = await $.clock.now()
-      await update($, meter, m => ({ ...m, lastResponseAt }))
+      const learned = gapAtStart === undefined ? undefined : learnTtl(gapAtStart, hitRatio(r.usage))
+      gapAtStart = undefined
+      const before = (await read($, meter)).ttl ?? '1h'
+      await update($, meter, m => ({ ...m, lastResponseAt, ttl: learned ?? m.ttl }))
+      if (learned && learned !== before) {
+        await $.store.set('ttl', learned)
+        $.ui.toast(`Prompt cache lives ${learned} on this account: countdown adjusted`)
+      }
     }
     return r
   })
@@ -257,18 +322,19 @@ export const register: Register = (on, options) => {
     const m = await update($, meter, m => ({
       ...m,
       context: e.context.percent,
-      ctxHistory: e.context.percent === undefined ? m.ctxHistory : push(m.ctxHistory, e.context.percent),
+      ctxHistory: e.context.percent === undefined ? m.ctxHistory : addContext(m.ctxHistory, e.context.percent),
       fiveHour: five?.percentUsed,
       fiveReset: five?.resetsAt,
       fiveSamples: five ? addSample(m.fiveSamples, { t: now, p: five.percentUsed }) : m.fiveSamples,
       weekly: week?.percentUsed,
       weeklyReset: week?.resetsAt,
     }))
-    const eta = etaMs(m.fiveSamples, now)
-    const resetIn = m.fiveReset ? Date.parse(m.fiveReset) - now : undefined
-    if (eta !== undefined && resetIn !== undefined && eta < resetIn && warnedFiveFor !== m.fiveReset) {
-      warnedFiveFor = m.fiveReset
-      $.ui.toast(`At this pace the 5h limit runs out in ~${duration(eta)}, ${duration(resetIn - eta)} before it resets`)
+    for (const id of ['5h', 'wk'] as const) {
+      const o = limitOutlook(m, id, now)
+      const reset = id === '5h' ? m.fiveReset : m.weeklyReset
+      if (!runsOut(o) || warnedFor[id] === reset) continue
+      warnedFor[id] = reset
+      $.ui.toast(`At this pace the ${LIMIT_NAME[id]} limit runs out in ~${duration(o.eta!)}, ${duration(o.resetIn! - o.eta!)} before it resets`)
     }
     return next(e)
   })
@@ -279,7 +345,7 @@ export const register: Register = (on, options) => {
     await read($, tick)
     const m = await read($, meter)
     const columns = e.props.bodyColumns ?? e.viewport?.columns ?? 120
-    const { left, repo } = fit(segments(m, await $.clock.now(), ttlMs), columns)
+    const { left, repo } = fit(segments(m, await $.clock.now()), columns)
     const draw = (parts: Part[]) => parts.map(p => <Text color={p.color} dimColor={p.dim} bold={p.bold}>{p.text}</Text>)
 
     return (

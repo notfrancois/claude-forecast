@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { Meter } from '../types'
-import { addSample, bar, compact, duration, etaMs, fit, hitRatio, isExpensive, segments, turnsLeft, until, width } from './register'
+import { addContext, addSample, bar, compact, duration, fit, fiveRate, hitRatio, isExpensive, learnTtl, limitOutlook, outlook, segments, spark, turnsLeft, until, weekRate, width } from './register'
 
 const MIN = 60_000
 
@@ -29,11 +29,55 @@ test('addSample drops samples older than 30 minutes', () => {
   expect(s).toEqual([{ t: 20 * MIN, p: 20 }, { t: 40 * MIN, p: 30 }])
 })
 
-test('etaMs forecasts from the pace', () => {
+test('outlook forecasts from the pace', () => {
   // 10 points in 10 minutes from 50 %: 50 points left takes 50 minutes.
-  expect(etaMs([{ t: 0, p: 40 }, { t: 10 * MIN, p: 50 }], 10 * MIN)).toBe(50 * MIN)
-  expect(etaMs([{ t: 0, p: 40 }, { t: MIN, p: 50 }], MIN)).toBe(undefined)
-  expect(etaMs([{ t: 0, p: 40 }], 0)).toBe(undefined)
+  const rate = fiveRate([{ t: 0, p: 40 }, { t: 10 * MIN, p: 50 }])
+  expect(outlook(50, rate, 20 * MIN)).toEqual({ eta: 50 * MIN, landing: 70 })
+  expect(fiveRate([{ t: 0, p: 40 }, { t: MIN, p: 50 }])).toBe(undefined)
+  expect(fiveRate([{ t: 0, p: 40 }])).toBe(undefined)
+  expect(outlook(50, undefined, MIN)).toEqual({})
+})
+
+test('fiveRate fits every sample, so a burst at the end barely moves it', () => {
+  const steady = [0, 5, 10, 15, 20].map(m => ({ t: m * MIN, p: 10 + m }))
+  const burst = [...steady.slice(0, -1), { t: 20 * MIN, p: 40 }]
+  const endpoints = (40 - 10) / (20 * MIN)
+  expect(fiveRate(steady)).toBe(1 / MIN)
+  expect(fiveRate(burst)! < endpoints).toBe(true)
+})
+
+test('weekRate uses the average since the window opened', () => {
+  const WEEK = 7 * 24 * 60 * MIN
+  // 2 days into the week at 40 %: 20 points a day, out in 3 more days.
+  const rate = weekRate(40, WEEK, 2 * 24 * 60 * MIN)
+  expect(outlook(40, rate, 5 * 24 * 60 * MIN).eta).toBe(3 * 24 * 60 * MIN)
+  expect(weekRate(1, WEEK, 30 * MIN)).toBe(undefined)
+})
+
+test('weekly segment warns before the reset', () => {
+  const now = 2 * 24 * 60 * MIN
+  const hot = { ...FULL, weekly: 40, weeklyReset: new Date(7 * 24 * 60 * MIN).toISOString() }
+  expect(limitOutlook(hot, 'wk', now).landing).toBe(140)
+  const wk = segments(hot, now).find(s => s.id === 'wk')!
+  expect(wk.full.map(p => p.text).join('').includes('out in 3d0h')).toBe(true)
+})
+
+test('addContext restarts after a compact', () => {
+  expect(addContext([40, 50, 60], 70)).toEqual([40, 50, 60, 70])
+  expect(addContext([40, 50, 60], 12)).toEqual([12])
+})
+
+test('learnTtl reads the hit ratio after a gap between 5m and 1h', () => {
+  expect(learnTtl(20 * MIN, 95)).toBe('1h')
+  expect(learnTtl(20 * MIN, 3)).toBe('5m')
+  expect(learnTtl(20 * MIN, 35)).toBe(undefined)
+  expect(learnTtl(2 * MIN, 3)).toBe(undefined)
+  expect(learnTtl(70 * MIN, 3)).toBe(undefined)
+})
+
+test('spark scales to the largest turn', () => {
+  expect(spark([0.1, 0.2, 0.4])).toBe('▃▅█')
+  expect(spark([0, 0])).toBe('▁▁')
 })
 
 test('turnsLeft averages context growth', () => {
@@ -53,10 +97,12 @@ test('isExpensive needs history and double the average', () => {
   expect(isExpensive(5, [0.1])).toBe(false)
 })
 
-test('bar fills by percent and clamps', () => {
-  expect(bar(62)).toEqual(['━━━', '──'])
-  expect(bar(0)).toEqual(['', '─────'])
-  expect(bar(130)).toEqual(['━━━━━', ''])
+test('bar fills by percent, clamps and ghosts the landing', () => {
+  expect(bar(50)).toEqual(['━━━━', '', '────'])
+  expect(bar(0)).toEqual(['', '', '────────'])
+  expect(bar(130)).toEqual(['━━━━━━━━', '', ''])
+  expect(bar(25, 75)).toEqual(['━━', '╍╍╍╍', '──'])
+  expect(bar(50, 140)).toEqual(['━━━━', '╍╍╍╍', ''])
 })
 
 const BASE: Meter = { busy: false, ctxHistory: [], fiveSamples: [], usdHistory: [] }
@@ -74,12 +120,12 @@ const FULL: Meter = {
 }
 
 const line = (columns: number) => {
-  const { left, repo } = fit(segments(FULL, MIN, 60 * MIN), columns)
+  const { left, repo } = fit(segments(FULL, MIN), columns)
   return { ids: left.map(p => p.map(x => x.text).join('')), repo: repo?.map(x => x.text).join('') }
 }
 
 test('calm values hide resets, turns left and the cache countdown', () => {
-  const texts = segments(FULL, MIN, 60 * MIN).flatMap(s => s.full.map(p => p.text)).join('')
+  const texts = segments(FULL, MIN).flatMap(s => s.full.map(p => p.text)).join('')
   expect(texts.includes('→')).toBe(false)
   expect(texts.includes('turns')).toBe(false)
   expect(texts.includes('left')).toBe(false)
@@ -87,7 +133,7 @@ test('calm values hide resets, turns left and the cache countdown', () => {
 
 test('details appear once they matter', () => {
   const hot = { ...FULL, context: 60, ctxHistory: [40, 50, 60], fiveHour: 75, fiveReset: new Date(90 * MIN).toISOString(), lastResponseAt: -56 * MIN }
-  const texts = segments(hot, MIN, 60 * MIN).flatMap(s => s.full.map(p => p.text)).join('')
+  const texts = segments(hot, MIN).flatMap(s => s.full.map(p => p.text)).join('')
   expect(texts.includes('~4 turns')).toBe(true)
   expect(texts.includes(`→${until(90 * MIN, MIN)}`)).toBe(true)
   expect(texts.includes('3m left')).toBe(true)
@@ -101,7 +147,7 @@ test('fit keeps everything on a wide terminal', () => {
 
 test('fit goes lean, then drops by priority, never past the width', () => {
   for (const columns of [120, 90, 70, 50, 30]) {
-    const { left, repo } = fit(segments(FULL, MIN, 60 * MIN), columns)
+    const { left, repo } = fit(segments(FULL, MIN), columns)
     const used = left.reduce((n, p) => n + width(p), 0) + 3 * Math.max(0, left.length - 1) + (repo ? 2 + width(repo) : 0)
     expect(used <= columns || left.length === 1).toBe(true)
   }
@@ -117,9 +163,9 @@ test('until shows a clock time, with the weekday when it is not today', () => {
 })
 
 test('cache hit turns yellow under 80 %', () => {
-  const low = segments({ ...FULL, hitRatio: 42 }, MIN, 60 * MIN).find(s => s.id === 'cache')!
+  const low = segments({ ...FULL, hitRatio: 42 }, MIN).find(s => s.id === 'cache')!
   expect(low.full.map(p => p.text).join('')).toBe('cache hit 42%')
   expect(low.full[1]!.color).toBe('yellow')
-  const ok = segments(FULL, MIN, 60 * MIN).find(s => s.id === 'cache')!
+  const ok = segments(FULL, MIN).find(s => s.id === 'cache')!
   expect(ok.full[1]!.color).toBe(undefined)
 })
